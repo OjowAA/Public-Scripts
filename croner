@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# audit_crons.sh
+# Quick, blunt cron job auditor for Ubuntu 18
+# Usage: sudo ./audit_crons.sh
+# Output: /tmp/cron_audit_<timestamp>.log
+
+set -euo pipefail
+
+TS="$(date +%Y%m%d-%H%M%S)"
+OUT="/tmp/cron_audit_${TS}.log"
+SUS_LOG="/tmp/cron_suspicious_${TS}.log"
+
+echo "CRON AUDIT - $(date -Iseconds)" > "$OUT"
+echo "Suspicious hits (wget/curl/nc/base64/tmp/python/perl/bash -i/etc/passwd...):" > "$SUS_LOG"
+
+# helper logger
+log() { echo "[$(date +%FT%T)] $*" | tee -a "$OUT"; }
+
+log "Starting cron audit"
+if [[ "$(id -u)" -ne 0 ]]; then
+  log "NOTICE: not running as root — results may be incomplete. Run as root for full audit."
+fi
+
+# 1) List /etc crontab and cron.d contents
+log "---- /etc/crontab ----"
+if [[ -f /etc/crontab ]]; then
+  echo >> "$OUT"
+  echo "---- /etc/crontab ----" >> "$OUT"
+  sed -n '1,200p' /etc/crontab | sed -n '1,200p' | tee -a "$OUT"
+else
+  log "/etc/crontab not present"
+fi
+
+log "---- /etc/cron.d (files) ----"
+if [[ -d /etc/cron.d ]]; then
+  for f in /etc/cron.d/*; do
+    [[ -e "$f" ]] || continue
+    echo "FILE: $f" >> "$OUT"
+    sed -n '1,200p' "$f" >> "$OUT"
+    echo >> "$OUT"
+  done
+else
+  log "/etc/cron.d missing"
+fi
+
+# 2) /etc/cron.{daily,weekly,monthly,hourly}
+for dir in /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly; do
+  log "---- Listing $dir ----"
+  if [[ -d "$dir" ]]; then
+    ls -la "$dir" | tee -a "$OUT"
+    echo >> "$OUT"
+  else
+    echo "$dir: (missing)" | tee -a "$OUT"
+  fi
+done
+
+# 3) User crontabs stored under /var/spool/cron/crontabs (Debian/Ubuntu)
+log "---- /var/spool/cron/crontabs (per-user crontabs) ----"
+if [[ -d /var/spool/cron/crontabs ]]; then
+  for f in /var/spool/cron/crontabs/*; do
+    [[ -e "$f" ]] || continue
+    user=$(basename "$f")
+    echo "USER: $user (file: $f)" >> "$OUT"
+    sed -n '1,200p' "$f" >> "$OUT"
+    echo >> "$OUT"
+  done
+else
+  log "/var/spool/cron/crontabs not found or inaccessible"
+fi
+
+# 4) Legacy /var/spool/cron (some distros)
+log "---- /var/spool/cron (legacy) ----"
+if [[ -d /var/spool/cron ]]; then
+  for f in /var/spool/cron/*; do
+    [[ -e "$f" ]] || continue
+    echo "FILE: $f" >> "$OUT"
+    sed -n '1,200p' "$f" >> "$OUT"
+    echo >> "$OUT"
+  done
+else
+  log "/var/spool/cron not present"
+fi
+
+# 5) Query crontab -l for each user in /etc/passwd (best-effort; requires permissions)
+log "---- per-user crontab (crontab -l -u <user>) ----"
+while IFS=: read -r uname _ uid _ _ home shell; do
+  # only real human/system users (UID >= 1000 plus some system users if desired). We'll do >=100 or >=1000?
+  if [[ "$uid" -ge 1000 || "$uid" -eq 0 ]]; then
+    if crontab -l -u "$uname" &>/dev/null; then
+      echo "=== crontab for $uname ===" >> "$OUT"
+      crontab -l -u "$uname" >> "$OUT" 2>/dev/null || true
+      echo >> "$OUT"
+    fi
+  fi
+done < /etc/passwd
+
+# 6) at jobs
+log "---- at jobs (/var/spool/at) ----"
+if command -v atq >/dev/null 2>&1; then
+  atq_output=$(atq 2>/dev/null || true)
+  if [[ -n "$atq_output" ]]; then
+    echo "atq output:" >> "$OUT"
+    echo "$atq_output" >> "$OUT"
+  else
+    log "No pending at jobs or at not installed."
+  fi
+else
+  log "at command not available"
+fi
+if [[ -d /var/spool/at ]]; then
+  echo "Contents of /var/spool/at:" >> "$OUT"
+  ls -la /var/spool/at >> "$OUT" 2>/dev/null || true
+fi
+
+# 7) systemd timers (if systemd present)
+if command -v systemctl >/dev/null 2>&1; then
+  log "---- systemd timers (systemctl list-timers --all) ----"
+  systemctl list-timers --all --no-pager | tee -a "$OUT" || true
+else
+  log "systemctl not found - skipping systemd timers"
+fi
+
+# 8) Find suspicious patterns in all cron files (downloads, encoded payloads, reverse shells, tmp dirs, etc.)
+log "Scanning cron files for suspicious patterns (wget|curl|nc|bash -i|base64|python -c|perl -e|/tmp/|mktemp|/dev/shm)"
+PATTERNS='wget|curl|nc -e|nc -c|bash -i|/dev/shm|/tmp/|mktemp|base64|python -c|perl -e|ruby -e|powershell|Invoke-Expression|curl -sS|curl -fsSL'
+# Search relevant locations
+SEARCH_PATHS=(
+  /etc/crontab
+  /etc/cron.d
+  /etc/cron.hourly
+  /etc/cron.daily
+  /etc/cron.weekly
+  /etc/cron.monthly
+  /var/spool/cron
+  /var/spool/cron/crontabs
+  /tmp
+)
+
+for p in "${SEARCH_PATHS[@]}"; do
+  if [[ -e "$p" ]]; then
+    # grep recursively where appropriate
+    if [[ -d "$p" ]]; then
+      grep -R --line-number -E "$PATTERNS" "$p" 2>/dev/null | tee -a "$SUS_LOG" || true
+    else
+      grep -n -E "$PATTERNS" "$p" 2>/dev/null | tee -a "$SUS_LOG" || true
+    fi
+  fi
+done
+
+# Also scan per-user crontabs output in $OUT for suspicious stuff
+grep -n -E "$PATTERNS" "$OUT" 2>/dev/null | tee -a "$SUS_LOG" || true
+
+# 9) Check permissions and ownership of crontab directories (misconfigurations)
+log "Checking permissions of cron directories and files"
+for f in /etc/crontab /etc/cron.d /var/spool/cron /var/spool/cron/crontabs; do
+  if [[ -e "$f" ]]; then
+    stat -c "%n %U %G %a" "$f" | tee -a "$OUT" || true
+  fi
+done
+
+# 10) Quick "recent modifications" check - files changed in last 7 days within cron dirs
+log "Recent modifications in cron directories (last 7 days)"
+find /etc/cron* /var/spool/cron* -mtime -7 -type f -print 2>/dev/null | tee -a "$OUT" || true
+
+# Summarize suspicious findings
+log "---- Summary of suspicious matches ----"
+if [[ -s "$SUS_LOG" ]]; then
+  echo "Suspicious matches (full details in $SUS_LOG):" | tee -a "$OUT"
+  sed -n '1,200p' "$SUS_LOG" | tee -a "$OUT"
+  log "ACTION: review each suspicious line. Look for unexpected downloads, base64 + bash, reverse-shell patterns, or scripts running from /tmp or /dev/shm."
+else
+  echo "No suspicious patterns found in searched cron files (see output for files scanned)." | tee -a "$OUT"
+fi
+
+log "Audit complete. Full report: $OUT"
+if [[ -s "$SUS_LOG" ]]; then
+  log "Suspicious hits: $SUS_LOG"
+fi
+
+exit 0
